@@ -192,22 +192,97 @@ def scan(
         raise typer.Exit(code=1)
 
     # 2. Get snapshots (demo or live)
+    store = SnapshotStore(cfg.snapshot_dir)
+
     if demo:
         from taproot_rca.demo import get_demo_before, get_demo_after
 
         console.print("[bold cyan]Running in demo mode[/bold cyan] — using built-in sample schema\n")
         before = get_demo_before()
         after = get_demo_after()
+
+        # Save and diff
+        snap_path = store.save(after)
+        console.print(f"[dim]Snapshot saved: {snap_path}[/dim]\n")
+
+        diff = diff_snapshots(before, after)
+
     else:
         # Live mode — introspect from database
-        console.print("[red]✗[/red] Live database scanning is not yet implemented.")
-        console.print("  Use [bold]--demo[/bold] to test with sample data:")
-        console.print("  [dim]taproot scan --demo[/dim]")
-        raise typer.Exit(code=1)
+        from taproot_rca.connectors.postgres import PostgresIntrospector
+        from taproot_rca.env_resolver import resolve_env_vars
 
-    # 3. Diff the snapshots
-    diff = diff_snapshots(before, after)
+        # Filter sources if --source was provided
+        sources_to_scan = cfg.sources
+        if source:
+            sources_to_scan = [s for s in cfg.sources if s.name == source]
+            if not sources_to_scan:
+                available = ", ".join(s.name for s in cfg.sources)
+                console.print(
+                    f"[red]✗[/red] Source '{source}' not found in config. "
+                    f"Available: {available}"
+                )
+                raise typer.Exit(code=1)
 
+        # For now, scan the first matching source
+        # (multi-source scanning in a future step)
+        src_cfg = sources_to_scan[0]
+        console.print(f"[bold cyan]Scanning source:[/bold cyan] {src_cfg.name} ({src_cfg.type.value})\n")
+
+        # Resolve env vars in connection string
+        try:
+            conn_string = resolve_env_vars(src_cfg.connection_string)
+        except EnvironmentError as exc:
+            console.print(f"[red]✗[/red] {exc}")
+            raise typer.Exit(code=1)
+
+        # Introspect current schema
+        try:
+            introspector = PostgresIntrospector(conn_string)
+            after = introspector.snapshot(
+                schemas=src_cfg.schemas,
+                source_name=src_cfg.name,
+            )
+        except ImportError:
+            console.print(
+                "[red]✗[/red] psycopg2 is required for Postgres scanning.\n"
+                "  Install it with: [bold]pip install taproot-rca[postgres][/bold]\n"
+                "  Or directly: [bold]pip install psycopg2-binary[/bold]"
+            )
+            raise typer.Exit(code=1)
+        except Exception as exc:
+            console.print(f"[red]✗[/red] Failed to connect to {src_cfg.name}: {exc}")
+            raise typer.Exit(code=1)
+
+        console.print(
+            f"[green]✓[/green] Introspected {len(after.tables)} table(s) "
+            f"from {', '.join(src_cfg.schemas)}\n"
+        )
+
+        # Save snapshot
+        snap_path = store.save(after)
+        console.print(f"[dim]Snapshot saved: {snap_path}[/dim]\n")
+
+        # Load previous snapshot for diffing
+        snapshots = store.list_snapshots(src_cfg.name)
+        if len(snapshots) < 2:
+            console.print(
+                "[yellow]⚠[/yellow]  First scan — no previous snapshot to diff against.\n"
+                "  This snapshot is now your baseline. Run [bold]taproot scan[/bold] again\n"
+                "  after schema changes to detect drift."
+            )
+            # Show what was captured
+            console.print(f"\n[bold]Captured schema:[/bold]\n")
+            for t in after.tables:
+                cols = ", ".join(c.name for c in t.columns)
+                console.print(f"  [cyan]{t.full_name}[/cyan] ({cols})")
+            return
+
+        # We have at least 2 snapshots — diff the latest two
+        before = store._load_snapshot(snapshots[1])  # second-newest
+        diff = diff_snapshots(before, after)
+
+    # 3. Evaluate drift
     if not diff.has_drift:
         console.print("[green]✓[/green] No schema drift detected.")
         return
@@ -215,12 +290,7 @@ def scan(
     console.print(f"[yellow]⚠[/yellow]  {diff.summary}\n")
     console.print("[dim]" + diff.to_diff_text() + "[/dim]\n")
 
-    # 4. Save the 'after' snapshot
-    store = SnapshotStore(cfg.snapshot_dir)
-    snap_path = store.save(after)
-    console.print(f"[dim]Snapshot saved: {snap_path}[/dim]\n")
-
-    # 5. Check Ollama is available
+    # 4. Check Ollama is available
     manager = OllamaManager(host=cfg.model.host)
     if not manager.is_server_running():
         console.print(
@@ -245,7 +315,7 @@ def scan(
             )
             raise typer.Exit(code=1)
 
-    # 6. Build the prompt and send to LLM
+    # 5. Build the prompt and send to LLM
     engine = PromptEngine(cfg)
     ctx = PromptContext(
         source_name=after.source_name,
@@ -275,7 +345,7 @@ def scan(
         # If not streaming, print the full response now
         console.print(response.content)
 
-    # 7. Print stats
+    # 6. Print stats
     if response.duration_seconds:
         console.print(
             f"\n[dim]Model: {response.model} | "

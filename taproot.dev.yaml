@@ -1,0 +1,107 @@
+# ============================================================================
+# Taproot-RCA — Local Development Config
+# ============================================================================
+# Use this with the Docker Postgres instance:
+#   docker compose up -d
+#   export PG_USER=taproot PG_PASS=taproot
+#   taproot scan -c taproot.dev.yaml
+# ============================================================================
+
+version: "1"
+
+model:
+  name: "qwen2.5-coder:3b"
+  host: "http://localhost:11434"
+  fallback: "qwen2.5-coder:1.5b"
+  temperature: 0.1
+  context_length: 4096
+
+prompts:
+  - role: detect
+    system: |
+      You are a senior data engineer specializing in schema management.
+      Analyze the provided schema diff and determine whether this constitutes
+      meaningful schema drift that could break downstream pipelines, reports,
+      or data contracts. Classify severity as: none, low, medium, high, critical.
+    user_template: |
+      Source: {source_name}
+
+      === Schema Before ===
+      {schema_before}
+
+      === Schema After ===
+      {schema_after}
+
+      === Diff ===
+      {diff}
+
+      Identify all schema changes. For each change, state:
+      1. What changed (column, type, constraint, table)
+      2. Severity and why
+      3. Which downstream consumers are likely affected
+
+  - role: diagnose
+    system: |
+      You are a root-cause analysis expert for data infrastructure.
+      Given a detected schema drift, determine the most likely cause
+      and whether it was intentional or accidental.
+    user_template: |
+      Source: {source_name}
+
+      === Detected Drift ===
+      {diff}
+
+      === Additional Context ===
+      {context}
+
+      Provide:
+      1. Most likely root cause
+      2. Confidence level (high / medium / low)
+      3. Whether this appears intentional or accidental
+      4. Recommended next steps
+
+  - role: remediate
+    system: |
+      You are a database migration expert. Generate safe, reversible
+      DDL statements to remediate the detected schema drift. Always
+      include a rollback section. Never drop data without explicit
+      confirmation markers.
+    user_template: |
+      Source: {source_name}
+      Database type: {context}
+
+      === Drift to Remediate ===
+      {diff}
+
+      Generate:
+      1. Forward migration DDL
+      2. Rollback migration DDL
+      3. Pre-migration safety checks
+      4. Post-migration validation queries
+
+  - role: validate
+    system: |
+      You are a QA engineer for database migrations. Review the
+      proposed remediation and confirm it is safe to apply.
+    user_template: |
+      Source: {source_name}
+
+      === Proposed Migration ===
+      {context}
+
+      Evaluate:
+      1. Could this cause data loss? (yes/no + explanation)
+      2. Is the rollback complete and correct?
+      3. Are there edge cases not covered?
+      4. Final verdict: SAFE / UNSAFE / NEEDS_REVIEW
+
+sources:
+  - name: "dev-ecommerce"
+    type: postgres
+    connection_string: "postgresql://${PG_USER}:${PG_PASS}@localhost:5434/ecommerce"
+    schemas:
+      - public
+      - analytics
+    poll_interval_seconds: 60
+
+snapshot_dir: ".taproot/snapshots"

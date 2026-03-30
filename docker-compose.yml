@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: taproot-postgres
+    environment:
+      POSTGRES_USER: taproot
+      POSTGRES_PASSWORD: taproot
+      POSTGRES_DB: ecommerce
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./dev/seed.sql:/docker-entrypoint-initdb.d/01_seed.sql
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
