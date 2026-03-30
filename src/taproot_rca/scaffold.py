@@ -1,0 +1,181 @@
+"""
+Generates a starter taproot.yaml configuration file.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+STARTER_YAML = """\
+# ============================================================================
+# Taproot-RCA Configuration
+# ============================================================================
+# Docs: https://github.com/your-org/taproot-rca
+#
+# This file defines your entire schema-drift detection and self-healing
+# pipeline: which LLM to use, how to prompt it, which data sources to
+# monitor, and where to push remediation commits.
+# ============================================================================
+
+version: "1"
+
+# ---------------------------------------------------------------------------
+# Ollama Model
+# ---------------------------------------------------------------------------
+# Specify the local LLM that powers drift detection and remediation.
+# Run `taproot models` to verify availability, or `taproot models --pull`
+# to download missing models automatically.
+
+model:
+  name: "llama3:8b"               # Primary model tag
+  host: "http://localhost:11434"   # Ollama server URL
+  fallback: "mistral"             # Used if primary model is unavailable
+  temperature: 0.1                # Low temp → deterministic analysis
+  context_length: 4096
+
+# ---------------------------------------------------------------------------
+# Prompt Templates
+# ---------------------------------------------------------------------------
+# Define the system + user prompts for each pipeline stage.
+# Available placeholders in user_template:
+#   {source_name}    — human-readable name of the data source
+#   {schema_before}  — previous schema snapshot (DDL / JSON)
+#   {schema_after}   — current schema snapshot
+#   {diff}           — computed diff between snapshots
+#   {context}        — additional context (e.g. recent migrations)
+
+prompts:
+  - role: detect
+    system: |
+      You are a senior data engineer specializing in schema management.
+      Analyze the provided schema diff and determine whether this constitutes
+      meaningful schema drift that could break downstream pipelines, reports,
+      or data contracts. Classify severity as: none, low, medium, high, critical.
+    user_template: |
+      Source: {source_name}
+
+      === Schema Before ===
+      {schema_before}
+
+      === Schema After ===
+      {schema_after}
+
+      === Diff ===
+      {diff}
+
+      Identify all schema changes. For each change, state:
+      1. What changed (column, type, constraint, table)
+      2. Severity and why
+      3. Which downstream consumers are likely affected
+
+  - role: diagnose
+    system: |
+      You are a root-cause analysis expert for data infrastructure.
+      Given a detected schema drift, determine the most likely cause
+      and whether it was intentional or accidental.
+    user_template: |
+      Source: {source_name}
+
+      === Detected Drift ===
+      {diff}
+
+      === Additional Context ===
+      {context}
+
+      Provide:
+      1. Most likely root cause
+      2. Confidence level (high / medium / low)
+      3. Whether this appears intentional or accidental
+      4. Recommended next steps
+
+  - role: remediate
+    system: |
+      You are a database migration expert. Generate safe, reversible
+      DDL statements to remediate the detected schema drift. Always
+      include a rollback section. Never drop data without explicit
+      confirmation markers.
+    user_template: |
+      Source: {source_name}
+      Database type: {context}
+
+      === Drift to Remediate ===
+      {diff}
+
+      Generate:
+      1. Forward migration DDL
+      2. Rollback migration DDL
+      3. Pre-migration safety checks
+      4. Post-migration validation queries
+
+  - role: validate
+    system: |
+      You are a QA engineer for database migrations. Review the
+      proposed remediation and confirm it is safe to apply.
+    user_template: |
+      Source: {source_name}
+
+      === Proposed Migration ===
+      {context}
+
+      Evaluate:
+      1. Could this cause data loss? (yes/no + explanation)
+      2. Is the rollback complete and correct?
+      3. Are there edge cases not covered?
+      4. Final verdict: SAFE / UNSAFE / NEEDS_REVIEW
+
+# ---------------------------------------------------------------------------
+# Data Sources
+# ---------------------------------------------------------------------------
+# Define the databases and services to monitor for schema drift.
+# Connection strings support environment variable interpolation: ${VAR_NAME}
+
+sources:
+  - name: "primary-postgres"
+    type: postgres
+    connection_string: "postgresql://${PG_USER}:${PG_PASS}@localhost:5432/mydb"
+    schemas:
+      - public
+      - analytics
+    poll_interval_seconds: 3600   # Check every hour
+
+  # Uncomment to add more sources:
+  #
+  # - name: "warehouse-snowflake"
+  #   type: snowflake
+  #   connection_string: "snowflake://${SF_USER}:${SF_PASS}@${SF_ACCOUNT}/mydb/public"
+  #   schemas:
+  #     - public
+  #   poll_interval_seconds: 7200
+  #
+  # - name: "app-mysql"
+  #   type: mysql
+  #   connection_string: "mysql+pymysql://${MYSQL_USER}:${MYSQL_PASS}@localhost:3306/app"
+  #   schemas:
+  #     - app
+  #   poll_interval_seconds: 1800
+
+# ---------------------------------------------------------------------------
+# Git Target (optional)
+# ---------------------------------------------------------------------------
+# Where to push auto-generated remediation commits.
+# Leave commented out until you're ready for self-healing.
+
+# git:
+#   repo_url: "git@github.com:your-org/schema-migrations.git"
+#   branch: "taproot/auto-heal"
+#   base_branch: "main"
+#   commit_prefix: "[taproot-rca]"
+#   auto_pr: false
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+# Local directory for schema snapshots (relative to project root).
+snapshot_dir: ".taproot/snapshots"
+"""
+
+
+def write_starter_config(dest: Path) -> None:
+    """Write the starter YAML config to *dest*."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(STARTER_YAML)
