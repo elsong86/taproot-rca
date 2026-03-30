@@ -7,6 +7,7 @@ Commands
   validate  Validate an existing config file
   models    Check / pull Ollama models defined in the config
   scan      Detect schema drift and analyze with the LLM
+  docs      Generate AI-powered schema documentation
 """
 
 from __future__ import annotations
@@ -352,6 +353,125 @@ def scan(
             f"Time: {response.duration_seconds:.1f}s | "
             f"Tokens: {response.eval_count or '?'}[/dim]"
         )
+
+    # 7. Auto-generate changelog entry
+    console.print("\n[dim]Documenting drift in changelog...[/dim]")
+    from taproot_rca.docs_generator import DocsGenerator
+
+    docs_gen = DocsGenerator(client=client, docs_dir=f"{cfg.snapshot_dir}/../docs")
+    changelog_path = docs_gen.append_changelog(
+        diff=diff,
+        before=before,
+        after=after,
+        stream=False,
+    )
+    console.print(f"[green]✓[/green] Changelog updated: [dim]{changelog_path}[/dim]")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# docs
+# ──────────────────────────────────────────────────────────────────────
+
+@app.command()
+def docs(
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="Config file path"),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Document a specific source"),
+    demo: bool = typer.Option(False, "--demo", help="Generate docs from built-in demo schema"),
+    lineage: bool = typer.Option(True, "--lineage/--no-lineage", help="Include lineage narrative"),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream LLM output"),
+):
+    """Generate AI-powered schema documentation (data dictionary, lineage)."""
+    from taproot_rca.config import load_config
+    from taproot_rca.docs_generator import DocsGenerator
+    from taproot_rca.ollama_client import OllamaClient
+    from taproot_rca.ollama_manager import OllamaManager
+    from taproot_rca.snapshot_store import SnapshotStore
+
+    # 1. Load config
+    try:
+        cfg = load_config(config)
+    except Exception as exc:
+        console.print(f"[red]✗[/red] Config error: {exc}")
+        raise typer.Exit(code=1)
+
+    # 2. Get the schema snapshot
+    if demo:
+        from taproot_rca.demo import get_demo_after
+        console.print("[bold cyan]Generating docs from demo schema[/bold cyan]\n")
+        snapshot = get_demo_after()
+    else:
+        # Try to load the latest snapshot from disk
+        store = SnapshotStore(cfg.snapshot_dir)
+
+        # Determine which source
+        if source:
+            src_cfg = next((s for s in cfg.sources if s.name == source), None)
+            if not src_cfg:
+                available = ", ".join(s.name for s in cfg.sources)
+                console.print(f"[red]✗[/red] Source '{source}' not found. Available: {available}")
+                raise typer.Exit(code=1)
+            source_name = src_cfg.name
+        else:
+            source_name = cfg.sources[0].name
+
+        snapshot = store.get_latest(source_name)
+        if not snapshot:
+            console.print(
+                f"[red]✗[/red] No snapshot found for '{source_name}'.\n"
+                "  Run [bold]taproot scan[/bold] first to capture the schema, "
+                "or use [bold]--demo[/bold]."
+            )
+            raise typer.Exit(code=1)
+
+        console.print(
+            f"[bold cyan]Generating docs for:[/bold cyan] {source_name} "
+            f"({len(snapshot.tables)} tables)\n"
+        )
+
+    # 3. Check Ollama
+    manager = OllamaManager(host=cfg.model.host)
+    if not manager.is_server_running():
+        console.print(
+            "[red]✗[/red] Ollama server not reachable. "
+            "Start it with: [bold]ollama serve[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    model_name = cfg.model.name
+    if not manager.is_model_available(model_name):
+        if cfg.model.fallback and manager.is_model_available(cfg.model.fallback):
+            model_name = cfg.model.fallback
+        else:
+            console.print(
+                f"[red]✗[/red] Model '{model_name}' not available. "
+                "Run [bold]taproot models --pull[/bold] first."
+            )
+            raise typer.Exit(code=1)
+
+    client = OllamaClient(
+        host=cfg.model.host,
+        model=model_name,
+        temperature=cfg.model.temperature,
+        context_length=cfg.model.context_length,
+    )
+
+    docs_dir = cfg.snapshot_dir.replace("snapshots", "docs")
+    docs_gen = DocsGenerator(client=client, docs_dir=docs_dir)
+
+    # 4. Generate data dictionary
+    dict_path = docs_gen.generate_data_dictionary(snapshot, stream=stream)
+    console.print(f"\n[green]✓[/green] Data dictionary: [bold]{dict_path}[/bold]")
+
+    # 5. Generate lineage (if requested)
+    if lineage:
+        console.print()
+        lineage_path = docs_gen.generate_lineage(snapshot, stream=stream)
+        console.print(f"\n[green]✓[/green] Lineage narrative: [bold]{lineage_path}[/bold]")
+
+    console.print(
+        f"\n[bold green]Documentation complete.[/bold green] "
+        f"Files are in [dim]{docs_dir}/[/dim]"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────
