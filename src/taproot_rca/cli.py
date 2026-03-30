@@ -6,6 +6,7 @@ Commands
   init      Scaffold a new taproot.yaml config file
   validate  Validate an existing config file
   models    Check / pull Ollama models defined in the config
+  scan      Detect schema drift and analyze with the LLM
 """
 
 from __future__ import annotations
@@ -162,6 +163,125 @@ def models(
         table.add_row(m.name, size_str, m.modified_at or "—")
 
     console.print(table)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# scan
+# ──────────────────────────────────────────────────────────────────────
+
+@app.command()
+def scan(
+    config: str = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="Config file path"),
+    source: Optional[str] = typer.Option(None, "--source", "-s", help="Scan a specific source by name"),
+    demo: bool = typer.Option(False, "--demo", help="Run with built-in demo data (no database needed)"),
+    stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream LLM output in real-time"),
+):
+    """Detect schema drift and analyze it with the configured LLM."""
+    from taproot_rca.config import load_config, PromptRole
+    from taproot_rca.ollama_client import OllamaClient
+    from taproot_rca.ollama_manager import OllamaManager
+    from taproot_rca.prompt_engine import PromptEngine, PromptContext
+    from taproot_rca.schema_diff import diff_snapshots
+    from taproot_rca.snapshot_store import SnapshotStore
+
+    # 1. Load config
+    try:
+        cfg = load_config(config)
+    except Exception as exc:
+        console.print(f"[red]✗[/red] Config error: {exc}")
+        raise typer.Exit(code=1)
+
+    # 2. Get snapshots (demo or live)
+    if demo:
+        from taproot_rca.demo import get_demo_before, get_demo_after
+
+        console.print("[bold cyan]Running in demo mode[/bold cyan] — using built-in sample schema\n")
+        before = get_demo_before()
+        after = get_demo_after()
+    else:
+        # Live mode — introspect from database
+        console.print("[red]✗[/red] Live database scanning is not yet implemented.")
+        console.print("  Use [bold]--demo[/bold] to test with sample data:")
+        console.print("  [dim]taproot scan --demo[/dim]")
+        raise typer.Exit(code=1)
+
+    # 3. Diff the snapshots
+    diff = diff_snapshots(before, after)
+
+    if not diff.has_drift:
+        console.print("[green]✓[/green] No schema drift detected.")
+        return
+
+    console.print(f"[yellow]⚠[/yellow]  {diff.summary}\n")
+    console.print("[dim]" + diff.to_diff_text() + "[/dim]\n")
+
+    # 4. Save the 'after' snapshot
+    store = SnapshotStore(cfg.snapshot_dir)
+    snap_path = store.save(after)
+    console.print(f"[dim]Snapshot saved: {snap_path}[/dim]\n")
+
+    # 5. Check Ollama is available
+    manager = OllamaManager(host=cfg.model.host)
+    if not manager.is_server_running():
+        console.print(
+            "[red]✗[/red] Ollama server not reachable. "
+            "Start it with: [bold]ollama serve[/bold]"
+        )
+        raise typer.Exit(code=1)
+
+    # Determine which model to use
+    model_name = cfg.model.name
+    if not manager.is_model_available(model_name):
+        if cfg.model.fallback and manager.is_model_available(cfg.model.fallback):
+            console.print(
+                f"[yellow]⚠[/yellow]  Primary model '{model_name}' not found, "
+                f"using fallback: {cfg.model.fallback}"
+            )
+            model_name = cfg.model.fallback
+        else:
+            console.print(
+                f"[red]✗[/red] Model '{model_name}' not available. "
+                "Run [bold]taproot models --pull[/bold] first."
+            )
+            raise typer.Exit(code=1)
+
+    # 6. Build the prompt and send to LLM
+    engine = PromptEngine(cfg)
+    ctx = PromptContext(
+        source_name=after.source_name,
+        schema_before=before.to_ddl(),
+        schema_after=after.to_ddl(),
+        diff=diff.to_diff_text(),
+    )
+
+    prompt = engine.hydrate(PromptRole.DETECT, ctx)
+
+    console.print(f"[bold cyan]Analyzing drift with {model_name}...[/bold cyan]\n")
+
+    client = OllamaClient(
+        host=cfg.model.host,
+        model=model_name,
+        temperature=cfg.model.temperature,
+        context_length=cfg.model.context_length,
+    )
+
+    response = client.chat(
+        system=prompt.system,
+        user=prompt.user,
+        stream=stream,
+    )
+
+    if not stream:
+        # If not streaming, print the full response now
+        console.print(response.content)
+
+    # 7. Print stats
+    if response.duration_seconds:
+        console.print(
+            f"\n[dim]Model: {response.model} | "
+            f"Time: {response.duration_seconds:.1f}s | "
+            f"Tokens: {response.eval_count or '?'}[/dim]"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
