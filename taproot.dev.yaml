@@ -111,4 +111,11 @@ sources:
       - public
     poll_interval_seconds: 60
 
+git:
+  repo_url: "https://github.com/elsong86/taproot-rca.git"
+  branch: "taproot/auto-heal"
+  base_branch: "main"
+  commit_prefix: "[taproot-rca]"
+  auto_pr: true
+
 snapshot_dir: ".taproot/snapshots"

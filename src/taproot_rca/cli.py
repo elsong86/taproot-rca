@@ -19,6 +19,15 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+# Auto-load .env from the current working directory (or any parent dir).
+# This makes environment variables defined in .env available to taproot
+# without requiring users to manually `export` them each session.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv is optional — taproot still works without it
+
 app = typer.Typer(
     name="taproot",
     help="AI-powered schema drift detection & self-healing for data engineers.",
@@ -347,6 +356,74 @@ def scan(
         stream=False,
     )
     console.print(f"[green]✓[/green] Changelog updated: [dim]{changelog_path}[/dim]")
+
+    # 8. Self-heal: extract migration SQL and push to Git
+    if cfg.git is None:
+        console.print(
+            "\n[dim]Skipping auto-heal — no [bold]git[/bold] section in config.[/dim]"
+        )
+        return
+
+    from taproot_rca.config import PromptRole
+    from taproot_rca.sql_extractor import extract_migration, write_migration_files
+    from taproot_rca.git_ops.healer import GitHealer
+
+    remediation = result.get_stage(PromptRole.REMEDIATE)
+    if not remediation or not remediation.content:
+        console.print(
+            "\n[yellow]⚠[/yellow]  No remediation output to push — skipping auto-heal."
+        )
+        return
+
+    console.print("\n[bold cyan]Self-healing: extracting migration SQL...[/bold cyan]")
+
+    migration = extract_migration(remediation.content)
+
+    if not migration.is_complete:
+        console.print(
+            "[yellow]⚠[/yellow]  Could not extract complete forward + rollback SQL "
+            "from the remediation output. Skipping Git push."
+        )
+        return
+
+    # Write migration files
+    forward_path, rollback_path = write_migration_files(
+        migration=migration,
+        source_name=after.source_name,
+        output_dir="migrations",
+    )
+    console.print(f"  [green]✓[/green] Forward migration:  [dim]{forward_path}[/dim]")
+    console.print(f"  [green]✓[/green] Rollback migration: [dim]{rollback_path}[/dim]")
+
+    # Push to Git
+    console.print(f"\n[bold cyan]Pushing to Git:[/bold cyan] {cfg.git.repo_url}")
+
+    try:
+        healer = GitHealer(config=cfg.git)
+        push_result = healer.push_migrations(
+            migration_files=[forward_path, rollback_path],
+            source_name=after.source_name,
+            diff_summary=diff.summary,
+            analysis_report=result.get_stage(PromptRole.DETECT).content if result.get_stage(PromptRole.DETECT) else None,
+        )
+
+        console.print(f"  [green]✓[/green] Branch:  [bold]{push_result.branch_name}[/bold]")
+        console.print(f"  [green]✓[/green] Commit:  [dim]{push_result.commit_sha[:8]}[/dim]")
+        console.print(f"  [green]✓[/green] Files committed: {len(push_result.files_committed)}")
+
+        if push_result.pr_url:
+            console.print(
+                f"\n[bold green]Pull request opened:[/bold green] "
+                f"[link={push_result.pr_url}]{push_result.pr_url}[/link]"
+            )
+        elif cfg.git.auto_pr:
+            console.print(
+                "\n[yellow]⚠[/yellow]  Branch was pushed but PR was not opened.\n"
+                "  Set [bold]GITHUB_TOKEN[/bold] environment variable to enable auto-PR creation."
+            )
+
+    except Exception as exc:
+        console.print(f"\n[red]✗[/red] Git push failed: {exc}")
 
 
 # ──────────────────────────────────────────────────────────────────────
