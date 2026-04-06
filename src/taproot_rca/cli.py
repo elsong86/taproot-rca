@@ -178,10 +178,9 @@ def scan(
     stream: bool = typer.Option(True, "--stream/--no-stream", help="Stream LLM output in real-time"),
 ):
     """Detect schema drift and analyze it with the configured LLM."""
-    from taproot_rca.config import load_config, PromptRole
+    from taproot_rca.config import load_config
     from taproot_rca.ollama_client import OllamaClient
     from taproot_rca.ollama_manager import OllamaManager
-    from taproot_rca.prompt_engine import PromptEngine, PromptContext
     from taproot_rca.schema_diff import diff_snapshots
     from taproot_rca.snapshot_store import SnapshotStore
 
@@ -316,18 +315,10 @@ def scan(
             )
             raise typer.Exit(code=1)
 
-    # 5. Build the prompt and send to LLM
-    engine = PromptEngine(cfg)
-    ctx = PromptContext(
-        source_name=after.source_name,
-        schema_before=before.to_ddl(),
-        schema_after=after.to_ddl(),
-        diff=diff.to_diff_text(),
-    )
+    # 5. Run the full pipeline
+    from taproot_rca.pipeline import Pipeline, save_pipeline_report
 
-    prompt = engine.hydrate(PromptRole.DETECT, ctx)
-
-    console.print(f"[bold cyan]Analyzing drift with {model_name}...[/bold cyan]\n")
+    console.print(f"[bold cyan]Running analysis pipeline with {model_name}...[/bold cyan]")
 
     client = OllamaClient(
         host=cfg.model.host,
@@ -336,23 +327,13 @@ def scan(
         context_length=cfg.model.context_length,
     )
 
-    response = client.chat(
-        system=prompt.system,
-        user=prompt.user,
-        stream=stream,
-    )
+    pipeline = Pipeline(config=cfg, client=client, stream=stream)
+    result = pipeline.run(diff=diff, before=before, after=after)
 
-    if not stream:
-        # If not streaming, print the full response now
-        console.print(response.content)
-
-    # 6. Print stats
-    if response.duration_seconds:
-        console.print(
-            f"\n[dim]Model: {response.model} | "
-            f"Time: {response.duration_seconds:.1f}s | "
-            f"Tokens: {response.eval_count or '?'}[/dim]"
-        )
+    # 6. Save the full report
+    reports_dir = cfg.snapshot_dir.replace("snapshots", "reports")
+    report_path = save_pipeline_report(result, diff, output_dir=reports_dir)
+    console.print(f"\n[green]✓[/green] Full report saved: [bold]{report_path}[/bold]")
 
     # 7. Auto-generate changelog entry
     console.print("\n[dim]Documenting drift in changelog...[/dim]")

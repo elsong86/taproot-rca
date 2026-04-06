@@ -104,4 +104,11 @@ sources:
       - analytics
     poll_interval_seconds: 60
 
+  - name: "neon-sandbox"
+    type: postgres
+    connection_string: "${NEON_CONN}"
+    schemas:
+      - public
+    poll_interval_seconds: 60
+
 snapshot_dir: ".taproot/snapshots"
